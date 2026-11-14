@@ -1,0 +1,41 @@
+name: Build PrismCalc
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip project
+        run: unzip -q prismcalc.zip -d prismcalc
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+
+      - name: Create debug keystore
+        run: |
+          keytool -genkeypair -v -keystore prismcalc/debug.keystore \
+            -storepass android -keypass android -alias androiddebugkey \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA -keysize 2048 -validity 10000
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Build debug APK
+        run: gradle -p prismcalc assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prismcalc-debug
+          path: prismcalc/app/build/outputs/apk/debug/*.apk
