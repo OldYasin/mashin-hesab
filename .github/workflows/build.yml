@@ -1,0 +1,293 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-azarakhsh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Azarakhsh zip
+        id: check
+        run: |
+          z=$(find . -maxdepth 1 -type f -iname '*Azarakhsh*.zip' | sort -V | tail -n1)
+          if [ -z "$z" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No *Azarakhsh*.zip found; skipping Azarakhsh build."
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "zip=$z" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          gradle-version: '9.3.1'
+          cache-read-only: false
+
+      - name: Accept Android licenses
+        if: steps.check.outputs.found == 'true'
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Unpack Azarakhsh project
+        if: steps.check.outputs.found == 'true'
+        run: |
+          z="${{ steps.check.outputs.zip }}"
+          echo "Unpacking $z"
+          rm -rf project-src
+          unzip -q -o "$z" -d project-src
+          f=$(find ./project-src -name settings.gradle.kts | head -n1)
+          if [ -z "$f" ]; then
+            echo "::error::settings.gradle.kts not found inside $z"
+            exit 1
+          fi
+          ROOT="$(cd "$(dirname "$f")" && pwd)"
+          [ -f "$ROOT/app/build.gradle.kts" ] || { echo "::error::app/build.gradle.kts missing"; exit 1; }
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Prepare signing key
+        if: steps.check.outputs.found == 'true'
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$KS"
+            echo "Using keystore from secrets"
+          else
+            echo "::warning::KEYSTORE_BASE64 secret not set - signing with a throwaway CI key"
+            KS_PASS="ci-temp-pass"; KEY_PASS="ci-temp-pass"; KS_ALIAS="upload"
+            keytool -genkeypair -keystore "$KS" -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Azarakhsh CI" 2>/dev/null
+          fi
+          {
+            echo "KEYSTORE_PATH=$KS"
+            echo "STORE_PASSWORD=$KS_PASS"
+            echo "KEY_PASSWORD=${KEY_PASS:-$KS_PASS}"
+            echo "KEY_ALIAS=${KS_ALIAS:-upload}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build Azarakhsh release APK
+        if: steps.check.outputs.found == 'true'
+        run: gradle -p "$ROOT" assembleRelease -PfastBuild --parallel --build-cache --no-configuration-cache
+
+      - name: Verify signature
+        if: steps.check.outputs.found == 'true'
+        run: |
+          APK=$(ls "$ROOT"/app/build/outputs/apk/release/*.apk | head -n1)
+          "$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n1)apksigner" verify --verbose "$APK"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          name: azarakhsh-release-apk
+          path: ${{ env.ROOT }}/app/build/outputs/apk/release/*.apk
+          compression-level: 0
+
+  build-bazirox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Bazirox sources
+        id: check
+        run: |
+          if [ -f bazirox.zip ] || find . -name CPanelApiClient.kt -not -path './.git/*' | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No bazirox.zip or CPanelApiClient.kt found; skipping Bazirox build."
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          gradle-version: '9.3.1'
+          cache-read-only: false
+
+      - name: Accept Android licenses
+        if: steps.check.outputs.found == 'true'
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Unpack and locate Bazirox project
+        if: steps.check.outputs.found == 'true'
+        run: |
+          if [ -f bazirox.zip ] && ! find . -name CPanelApiClient.kt -not -path './.git/*' | grep -q .; then
+            unzip -q -o bazirox.zip -d bazirox-src
+          fi
+          f=$(find . -name CPanelApiClient.kt -not -path '*/build/*' | head -n1)
+          if [ -z "$f" ]; then
+            echo "::error::Bazirox sources (CPanelApiClient.kt) not found"
+            exit 1
+          fi
+          ROOT="${f%/app/src/main/java/com/example/data/CPanelApiClient.kt}"
+          if [ ! -f "$ROOT/settings.gradle.kts" ] && [ ! -f "$ROOT/settings.gradle" ]; then
+            echo "::error::No settings.gradle(.kts) in $ROOT"
+            exit 1
+          fi
+          echo "Gradle root: $ROOT"
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Prepare signing key
+        if: steps.check.outputs.found == 'true'
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$KS"
+            echo "Using keystore from secrets"
+          else
+            echo "::warning::KEYSTORE_BASE64 secret not set - signing with a throwaway CI key"
+            KS_PASS="ci-temp-pass"; KEY_PASS="ci-temp-pass"; KS_ALIAS="upload"
+            keytool -genkeypair -keystore "$KS" -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Bazirox CI"
+          fi
+          {
+            echo "KEYSTORE_PATH=$KS"
+            echo "STORE_PASSWORD=$KS_PASS"
+            echo "KEY_PASSWORD=${KEY_PASS:-$KS_PASS}"
+            echo "KEY_ALIAS=${KS_ALIAS:-upload}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build Bazirox release APK
+        if: steps.check.outputs.found == 'true'
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+        run: |
+          if [ -z "$API_SECRET" ] || [ -z "$API_BASE_URL" ]; then
+            echo "::error::API_SECRET / API_BASE_URL is empty"
+            exit 1
+          fi
+          gradle -p "$ROOT" assembleRelease --parallel --build-cache --no-configuration-cache
+
+      - name: Verify signature
+        if: steps.check.outputs.found == 'true'
+        run: |
+          APK=$(ls "$ROOT"/app/build/outputs/apk/release/*.apk | head -n1)
+          "$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n1)apksigner" verify --verbose "$APK"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          name: bazirox-release-apk
+          path: ${{ env.ROOT }}/app/build/outputs/apk/release/*.apk
+
+  build-mytv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check MyTV zip
+        id: check
+        run: |
+          z=$(find . -maxdepth 1 -type f -iname '*mytv*.zip' | sort -V | tail -n1)
+          if [ -z "$z" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No *mytv*.zip found; skipping MyTV build."
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "zip=$z" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          gradle-version: '9.3.1'
+          cache-read-only: false
+
+      - name: Accept Android licenses
+        if: steps.check.outputs.found == 'true'
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Unpack MyTV project
+        if: steps.check.outputs.found == 'true'
+        run: |
+          z="${{ steps.check.outputs.zip }}"
+          echo "Unpacking $z"
+          rm -rf mytv-src
+          unzip -q -o "$z" -d mytv-src
+          f=$(find ./mytv-src -name settings.gradle.kts | head -n1)
+          if [ -z "$f" ]; then
+            echo "::error::settings.gradle.kts not found inside $z"
+            exit 1
+          fi
+          ROOT="$(cd "$(dirname "$f")" && pwd)"
+          [ -f "$ROOT/app/build.gradle.kts" ] || { echo "::error::app/build.gradle.kts missing"; exit 1; }
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Prepare signing key
+        if: steps.check.outputs.found == 'true'
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$KS"
+            echo "Using keystore from secrets"
+          else
+            echo "::warning::KEYSTORE_BASE64 secret not set - signing with a throwaway CI key"
+            KS_PASS="ci-temp-pass"; KEY_PASS="ci-temp-pass"; KS_ALIAS="upload"
+            keytool -genkeypair -keystore "$KS" -storepass "$KS_PASS" -keypass "$KEY_PASS"               -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=MyTV CI" 2>/dev/null
+          fi
+          {
+            echo "KEYSTORE_PATH=$KS"
+            echo "STORE_PASSWORD=$KS_PASS"
+            echo "KEY_PASSWORD=${KEY_PASS:-$KS_PASS}"
+            echo "KEY_ALIAS=${KS_ALIAS:-upload}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build MyTV release APK
+        if: steps.check.outputs.found == 'true'
+        run: gradle -p "$ROOT" assembleRelease --parallel --build-cache --no-configuration-cache
+
+      - name: Verify signature
+        if: steps.check.outputs.found == 'true'
+        run: |
+          APK=$(ls "$ROOT"/app/build/outputs/apk/release/*.apk | head -n1)
+          "$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n1)apksigner" verify --verbose "$APK"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.found == 'true'
+        with:
+          name: mytv-release-apk
+          path: ${{ env.ROOT }}/app/build/outputs/apk/release/*.apk
+          compression-level: 0
